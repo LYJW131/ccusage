@@ -547,34 +547,24 @@ pub(crate) fn has_unsupported_null_field(line: &[u8]) -> bool {
     false
 }
 
-/// Byte range of the `iterations` array body that sits directly in a `usage` object, found
-/// without deserialising the line. Every `"usage"` key whose value is an object is walked key
-/// by key at that object's own level (string contents and escapes are skipped, JSON whitespace
-/// is tolerated), so an `iterations` array nested elsewhere in the line — in another object,
-/// deeper inside `usage`, or as text inside a string — never matches. Key names are compared as
-/// raw bytes, like the `"usage":{` marker the loader already relies on.
+/// Byte range of the `message.usage.iterations` array body, found without deserialising the line.
+/// Each object is walked at its own level, so same-named members in unrelated objects or string
+/// contents cannot provide the exemption.
 fn iterations_span(line: &[u8]) -> Option<std::ops::Range<usize>> {
-    const USAGE_KEY: &[u8] = br#""usage""#;
-    let mut offset = 0;
-    while let Some(found) = memmem::find(&line[offset..], USAGE_KEY) {
-        let key_end = offset + found + USAGE_KEY.len();
-        offset = key_end;
-        let Some(body) = expect_after_whitespace(line, key_end, b':')
-            .and_then(|index| expect_after_whitespace(line, index, b'{'))
-        else {
-            continue;
-        };
-        if let Some(span) = iterations_in_object(line, body) {
-            return Some(span);
-        }
-    }
-    None
+    let root = expect_after_whitespace(line, 0, b'{')?;
+    let message = container_member_body(line, root, b"message", b'{')?;
+    let usage = container_member_body(line, message, b"usage", b'{')?;
+    let iterations = container_member_body(line, usage, b"iterations", b'[')?;
+    Some(iterations..container_end(line, iterations)?)
 }
 
-/// Walks the members of the object whose body starts at `start` and returns the body range of
-/// the first `iterations` member whose value is an array. Values of other members are skipped
-/// whole, so nothing inside them can match.
-fn iterations_in_object(line: &[u8], start: usize) -> Option<std::ops::Range<usize>> {
+/// Walks one object level and returns the body start of a named container member.
+fn container_member_body(
+    line: &[u8],
+    start: usize,
+    wanted_key: &[u8],
+    opening: u8,
+) -> Option<usize> {
     let mut index = skip_whitespace(line, start);
     loop {
         match line.get(index)? {
@@ -586,28 +576,33 @@ fn iterations_in_object(line: &[u8], start: usize) -> Option<std::ops::Range<usi
         let key = &line[index + 1..key_end];
         let value = expect_after_whitespace(line, key_end + 1, b':')?;
         let value = skip_whitespace(line, value);
-        let value_end = match line.get(value)? {
-            b'[' if key == b"iterations" => {
-                return Some(value + 1..container_end(line, value + 1)?);
-            }
-            b'[' | b'{' => container_end(line, value + 1)?,
-            b'"' => string_end(line, value + 1)?,
-            _ => {
-                let mut end = value;
-                while line
-                    .get(end)
-                    .is_some_and(|byte| !matches!(byte, b',' | b'}'))
-                {
-                    end += 1;
-                }
-                end - 1
-            }
-        };
+        if key == wanted_key {
+            return (line.get(value) == Some(&opening)).then_some(value + 1);
+        }
+        let value_end = json_value_end(line, value)?;
         index = skip_whitespace(line, value_end + 1);
         match line.get(index)? {
             b',' => index = skip_whitespace(line, index + 1),
             b'}' => return None,
             _ => return None,
+        }
+    }
+}
+
+/// Index of the last byte in the JSON value beginning at `start`.
+fn json_value_end(line: &[u8], start: usize) -> Option<usize> {
+    match line.get(start)? {
+        b'[' | b'{' => container_end(line, start + 1),
+        b'"' => string_end(line, start + 1),
+        _ => {
+            let mut end = start;
+            while line
+                .get(end)
+                .is_some_and(|byte| !matches!(byte, b',' | b'}'))
+            {
+                end += 1;
+            }
+            (end > start).then_some(end - 1)
         }
     }
 }
@@ -888,7 +883,7 @@ mod tests {
         assert!(has_unsupported_null_field(
             br#"{"toolUseResult":{"iterations":[{"model":null}]},"message":{"model":"m","usage":{"input_tokens":1}}}"#
         ));
-        // A `usage` member that is not an object is skipped in favour of the real one.
+        // A `usage` member that is not an object is skipped in favor of the real one.
         assert!(!has_unsupported_null_field(
             br#"{"usage":"n/a","message":{"model":"m","usage":{"iterations":[{"type":"message","model":null}]}}}"#
         ));
@@ -903,6 +898,17 @@ mod tests {
         // Members before `iterations` may hold nested containers and strings with brackets.
         assert!(!has_unsupported_null_field(
             br#"{"message":{"model":"m","usage":{"cache_creation":{"ephemeral_5m_input_tokens":0},"server_tool_use":{"web_search_requests":0},"inference_geo":"[not]{available}","iterations":[{"type":"message","model":null}]}}}"#
+        ));
+        // Only the direct `message.usage` object may provide the exempted array.
+        assert!(!has_unsupported_null_field(
+            br#"{"usage":{"iterations":[{"model":"decoy"}]},"message":{"model":"m","usage":{"iterations":[{"type":"message","model":null}]}}}"#
+        ));
+    }
+
+    #[test]
+    fn malformed_usage_members_do_not_panic_the_null_precheck() {
+        assert!(has_unsupported_null_field(
+            br#"{"message":{"model":"m","usage":{"input_tokens":,"iterations":[{"type":"message","model":null}]}}}"#
         ));
     }
 
