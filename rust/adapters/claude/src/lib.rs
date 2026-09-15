@@ -14,7 +14,10 @@ use std::{
 use jiff::tz::TimeZone as JiffTimeZone;
 use memchr::memmem;
 use rustc_hash::FxHasher;
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{
+    Deserialize,
+    de::{DeserializeOwned, Error as _, MapAccess, SeqAccess, Visitor},
+};
 
 use crate::{
     LoadedEntry, LoadedFile, PricingMap, Result, Speed, TimestampMs, TokenUsageRaw, UsageEntry,
@@ -529,11 +532,105 @@ pub(crate) fn deserialize_usage_line<T: DeserializeOwned>(line: &[u8]) -> Option
     if memmem::find(line, b"null").is_none() {
         return serde_json::from_slice(line).ok();
     }
-    let root = serde_json::from_slice::<serde_json::Value>(line).ok()?;
+    let root = serde_json::from_slice::<UniqueJsonValue>(line).ok()?.0;
     if has_unsupported_null_field_in_value(&root) {
         return None;
     }
     serde_json::from_value(root).ok()
+}
+
+/// A JSON value parser that preserves typed Serde's rejection of duplicate members.
+/// Parsing through `serde_json::Value` normally keeps only the final duplicate, which could
+/// make a malformed transcript valid before the in-memory typed deserialization runs.
+struct UniqueJsonValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonValueVisitor)
+    }
+}
+
+struct UniqueJsonValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonValueVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value without duplicate object members")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> std::result::Result<Self::Value, E> {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .map(UniqueJsonValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        UniqueJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut fields = serde_json::Map::new();
+        while let Some(field) = object.next_key::<String>()? {
+            if fields.contains_key(&field) {
+                return Err(A::Error::custom(format!(
+                    "duplicate object member `{field}`"
+                )));
+            }
+            let value = object.next_value::<UniqueJsonValue>()?;
+            fields.insert(field, value.0);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Object(fields)))
+    }
 }
 
 fn has_unsupported_null_field_in_value(root: &serde_json::Value) -> bool {
@@ -654,8 +751,8 @@ mod tests {
     use std::{path::Path, sync::Arc};
 
     use super::{
-        extract_session_parts, has_unsupported_null_field, paths::is_project_path_segment,
-        push_deduped_entry, read_usage_file, usage_files,
+        deserialize_usage_line, extract_session_parts, has_unsupported_null_field,
+        paths::is_project_path_segment, push_deduped_entry, read_usage_file, usage_files,
     };
     use crate::{
         LoadedEntry, PricingMap, TimestampMs, TokenUsageRaw, UsageEntry, UsageMessage,
@@ -838,6 +935,14 @@ mod tests {
         assert!(!has_unsupported_null_field(
             br#"{"message":{"model":"m","usage":{"input_tokens":,"iterations":[{"type":"message","model":null}]}}}"#
         ));
+    }
+
+    #[test]
+    fn rejects_duplicate_members_before_typed_deserialization() {
+        assert!(deserialize_usage_line::<UsageEntry>(
+            br#"{"type":"assistant","timestamp":"2026-09-12T04:38:42.296Z","sessionId":"session-a","message":{"id":"msg_1","model":"first","model":"second","usage":{"input_tokens":2,"output_tokens":289,"iterations":[{"type":"message","model":null,"input_tokens":2,"output_tokens":289}]}}}"#
+        )
+        .is_none());
     }
 
     /// The repro line from #1710 loads as one Fable 5.1 entry with its own token counts.
