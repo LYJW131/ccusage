@@ -14,7 +14,7 @@ use std::{
 use jiff::tz::TimeZone as JiffTimeZone;
 use memchr::memmem;
 use rustc_hash::FxHasher;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::{
     LoadedEntry, LoadedFile, PricingMap, Result, Speed, TimestampMs, TokenUsageRaw, UsageEntry,
@@ -312,10 +312,7 @@ fn read_usage_file(
         if usage_marker.find(line).is_none() {
             continue;
         }
-        if has_unsupported_null_field(line) {
-            continue;
-        }
-        let Ok(data) = serde_json::from_slice::<UsageEntry>(line) else {
+        let Some(data) = deserialize_usage_line::<UsageEntry>(line) else {
             continue;
         };
         let Some(timestamp) = parse_ts_timestamp(&data.timestamp) else {
@@ -514,13 +511,32 @@ fn is_valid_usage_entry(data: &UsageEntry) -> bool {
 /// is skipped before deserialisation. The direct `model` member of an element in either
 /// assistant or AgentProgress `usage.iterations` is the one exception, because
 /// `UsageIteration.model` is optional and Claude Code writes it as `null`.
-pub(crate) fn has_unsupported_null_field(line: &[u8]) -> bool {
+#[cfg(test)]
+fn has_unsupported_null_field(line: &[u8]) -> bool {
     if memmem::find(line, b"null").is_none() {
         return false;
     }
     let Ok(root) = serde_json::from_slice::<serde_json::Value>(line) else {
         return false;
     };
+    has_unsupported_null_field_in_value(&root)
+}
+
+/// Deserializes a transcript line while enforcing Claude's nullable-field contract.
+/// Lines containing `null` are parsed into a value once so structural validation and
+/// typed deserialization can share the same parse.
+pub(crate) fn deserialize_usage_line<T: DeserializeOwned>(line: &[u8]) -> Option<T> {
+    if memmem::find(line, b"null").is_none() {
+        return serde_json::from_slice(line).ok();
+    }
+    let root = serde_json::from_slice::<serde_json::Value>(line).ok()?;
+    if has_unsupported_null_field_in_value(&root) {
+        return None;
+    }
+    serde_json::from_value(root).ok()
+}
+
+fn has_unsupported_null_field_in_value(root: &serde_json::Value) -> bool {
     let iteration_arrays = [
         root.pointer("/message/usage/iterations"),
         root.pointer("/data/message/message/usage/iterations"),
@@ -528,7 +544,7 @@ pub(crate) fn has_unsupported_null_field(line: &[u8]) -> bool {
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
-    has_unsupported_null_value(&root, false, &iteration_arrays)
+    has_unsupported_null_value(root, false, &iteration_arrays)
 }
 
 fn has_unsupported_null_value(
