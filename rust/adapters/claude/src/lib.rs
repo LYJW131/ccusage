@@ -511,151 +511,48 @@ fn is_valid_usage_entry(data: &UsageEntry) -> bool {
 }
 
 /// Mirrors the TypeScript loader's schema: a line whose known non-nullable field is `null`
-/// is skipped before deserialisation. `message.usage.iterations[].model` is the one exception,
-/// because `UsageIteration.model` is optional and Claude Code writes it as `null`.
+/// is skipped before deserialisation. The direct `model` member of an element in either
+/// assistant or AgentProgress `usage.iterations` is the one exception, because
+/// `UsageIteration.model` is optional and Claude Code writes it as `null`.
 pub(crate) fn has_unsupported_null_field(line: &[u8]) -> bool {
-    let iterations = iterations_span(line);
-    let mut offset = 0;
-    while let Some(relative_index) = memmem::find(&line[offset..], b":null") {
-        let null_index = offset + relative_index;
-        let mut field_end = null_index.saturating_sub(1);
-        if line.get(field_end) != Some(&b'"') {
-            while field_end > 0 && line[field_end] != b'"' {
-                field_end -= 1;
+    if memmem::find(line, b"null").is_none() {
+        return false;
+    }
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return false;
+    };
+    let iteration_arrays = [
+        root.pointer("/message/usage/iterations"),
+        root.pointer("/data/message/message/usage/iterations"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    has_unsupported_null_value(&root, false, &iteration_arrays)
+}
+
+fn has_unsupported_null_value(
+    value: &serde_json::Value,
+    allow_iteration_model: bool,
+    iteration_arrays: &[&serde_json::Value],
+) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => fields.iter().any(|(field, value)| {
+            if value.is_null() && is_unsupported_nullable_field(field.as_bytes()) {
+                return !(allow_iteration_model && field == "model");
             }
+            has_unsupported_null_value(value, false, iteration_arrays)
+        }),
+        serde_json::Value::Array(values) => {
+            let is_iteration_array = iteration_arrays
+                .iter()
+                .any(|array| std::ptr::eq(*array, value));
+            values.iter().any(|value| {
+                has_unsupported_null_value(value, is_iteration_array, iteration_arrays)
+            })
         }
-        if line.get(field_end) == Some(&b'"') {
-            let mut field_start = field_end.saturating_sub(1);
-            while field_start > 0 && line[field_start] != b'"' {
-                field_start -= 1;
-            }
-            if line.get(field_start) == Some(&b'"') {
-                let field = &line[field_start + 1..field_end];
-                // `message.usage.iterations[].model` is `Option<String>` in `UsageIteration`,
-                // so a null there is fine; only `message.model` (outside the array) is not.
-                let nested_iteration_model = field == b"model"
-                    && iterations
-                        .as_ref()
-                        .is_some_and(|span| span.contains(&null_index));
-                if !nested_iteration_model && is_unsupported_nullable_field(field) {
-                    return true;
-                }
-            }
-        }
-        offset = null_index + b":null".len();
+        _ => false,
     }
-    false
-}
-
-/// Byte range of the `message.usage.iterations` array body, found without deserialising the line.
-/// Each object is walked at its own level, so same-named members in unrelated objects or string
-/// contents cannot provide the exemption.
-fn iterations_span(line: &[u8]) -> Option<std::ops::Range<usize>> {
-    let root = expect_after_whitespace(line, 0, b'{')?;
-    let message = container_member_body(line, root, b"message", b'{')?;
-    let usage = container_member_body(line, message, b"usage", b'{')?;
-    let iterations = container_member_body(line, usage, b"iterations", b'[')?;
-    Some(iterations..container_end(line, iterations)?)
-}
-
-/// Walks one object level and returns the body start of a named container member.
-fn container_member_body(
-    line: &[u8],
-    start: usize,
-    wanted_key: &[u8],
-    opening: u8,
-) -> Option<usize> {
-    let mut index = skip_whitespace(line, start);
-    loop {
-        match line.get(index)? {
-            b'}' => return None,
-            b'"' => {}
-            _ => return None,
-        }
-        let key_end = string_end(line, index + 1)?;
-        let key = &line[index + 1..key_end];
-        let value = expect_after_whitespace(line, key_end + 1, b':')?;
-        let value = skip_whitespace(line, value);
-        if key == wanted_key {
-            return (line.get(value) == Some(&opening)).then_some(value + 1);
-        }
-        let value_end = json_value_end(line, value)?;
-        index = skip_whitespace(line, value_end + 1);
-        match line.get(index)? {
-            b',' => index = skip_whitespace(line, index + 1),
-            b'}' => return None,
-            _ => return None,
-        }
-    }
-}
-
-/// Index of the last byte in the JSON value beginning at `start`.
-fn json_value_end(line: &[u8], start: usize) -> Option<usize> {
-    match line.get(start)? {
-        b'[' | b'{' => container_end(line, start + 1),
-        b'"' => string_end(line, start + 1),
-        _ => {
-            let mut end = start;
-            while line
-                .get(end)
-                .is_some_and(|byte| !matches!(byte, b',' | b'}'))
-            {
-                end += 1;
-            }
-            (end > start).then_some(end - 1)
-        }
-    }
-}
-
-/// Index of the bracket that closes the array or object whose body starts at `start`.
-fn container_end(line: &[u8], start: usize) -> Option<usize> {
-    let mut depth = 1usize;
-    let mut index = start;
-    while let Some(&byte) = line.get(index) {
-        match byte {
-            b'"' => index = string_end(line, index + 1)?,
-            b'[' | b'{' => depth += 1,
-            b']' | b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(index);
-                }
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    None
-}
-
-/// Index of the quote that closes the string whose contents start at `start`.
-fn string_end(line: &[u8], start: usize) -> Option<usize> {
-    let mut index = start;
-    while let Some(&byte) = line.get(index) {
-        match byte {
-            b'\\' => index += 1,
-            b'"' => return Some(index),
-            _ => {}
-        }
-        index += 1;
-    }
-    None
-}
-
-fn skip_whitespace(line: &[u8], mut index: usize) -> usize {
-    while line
-        .get(index)
-        .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
-    {
-        index += 1;
-    }
-    index
-}
-
-/// Index just past `expected` when it is the next non-whitespace byte at or after `start`.
-fn expect_after_whitespace(line: &[u8], start: usize, expected: u8) -> Option<usize> {
-    let index = skip_whitespace(line, start);
-    (line.get(index) == Some(&expected)).then_some(index + 1)
 }
 
 fn is_unsupported_nullable_field(field: &[u8]) -> bool {
@@ -824,6 +721,9 @@ mod tests {
             br#"{"message":{"model":null,"usage":{"input_tokens":0}}}"#
         ));
         assert!(has_unsupported_null_field(
+            br#"{"message":{"model": null,"usage":{"input_tokens":0}}}"#
+        ));
+        assert!(has_unsupported_null_field(
             br#"{"sessionId":null,"message":{"usage":{"input_tokens":0}}}"#
         ));
     }
@@ -876,6 +776,10 @@ mod tests {
         assert!(!has_unsupported_null_field(
             br#"{"message": {"model": "m", "usage" : { "input_tokens": 2, "iterations" : [ {"type": "message", "model": null} ] }}}"#
         ));
+        // Escaped property names are decoded before the structural path check.
+        assert!(!has_unsupported_null_field(
+            br#"{"message":{"model":"m","usage":{"iter\u0061tions" : [{"type":"message","model" : null}]}}}"#
+        ));
         // An earlier `iterations` array in another object does not stand in for the real one.
         assert!(!has_unsupported_null_field(
             br#"{"toolUseResult":{"iterations":[{"model":"x"}]},"message":{"model":"m","usage":{"iterations":[{"type":"message","model":null}]}}}"#
@@ -891,6 +795,10 @@ mod tests {
         assert!(has_unsupported_null_field(
             br#"{"message":{"model":"m","usage":{"server_tool_use":{"iterations":[{"model":null}]},"input_tokens":1}}}"#
         ));
+        // A nested object's model is not the optional model of the iteration itself.
+        assert!(has_unsupported_null_field(
+            br#"{"message":{"model":"m","usage":{"iterations":[{"type":"message","metadata":{"model":null}}]}}}"#
+        ));
         // The key as text inside a string value is not a member.
         assert!(has_unsupported_null_field(
             br#"{"message":{"content":"\"usage\":{\"iterations\":[","model":null,"usage":{"input_tokens":1}}}"#
@@ -903,11 +811,15 @@ mod tests {
         assert!(!has_unsupported_null_field(
             br#"{"usage":{"iterations":[{"model":"decoy"}]},"message":{"model":"m","usage":{"iterations":[{"type":"message","model":null}]}}}"#
         ));
+        // AgentProgress records wrap the assistant message under `data.message.message`.
+        assert!(!has_unsupported_null_field(
+            br#"{"type":"progress","data":{"message":{"message":{"model":"m","usage":{"iterations":[{"type":"message","model":null}]}}}}}"#
+        ));
     }
 
     #[test]
     fn malformed_usage_members_do_not_panic_the_null_precheck() {
-        assert!(has_unsupported_null_field(
+        assert!(!has_unsupported_null_field(
             br#"{"message":{"model":"m","usage":{"input_tokens":,"iterations":[{"type":"message","model":null}]}}}"#
         ));
     }
